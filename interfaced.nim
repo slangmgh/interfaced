@@ -103,9 +103,6 @@ proc get_dispatch_table_var(inf_name: NimNode): NimNode =
 proc get_dispatch_indexes_var(inf_name: NimNode): NimNode =
   nnkAccQuoted.newTree(ident(":" & $inf_name & "_dispatch_indexes"))
 
-proc get_proc_variable(impl_name, method_name: NimNode): NimNode =
-  nnkAccQuoted.newTree(ident(":Var" & $impl_name & "_" & $method_name))
-
 proc get_interface_constructor_name(inf_name: NimNode): NimNode =
   nnkAccQuoted.newTree(ident(":Create" & $inf_name))
 
@@ -170,35 +167,22 @@ proc add_method_checker(impl_name, inf_name: NimNode): NimNode =
     # change first argument type to `impl_name`
     def_vars[0][1] = impl_name
 
-    let method_checker =
-      if params[0] == ident("void") or params[0].kind == nnkEmpty:
-        newStmtList(def_vars, meth)
-      else:
-        newStmtList(def_vars, newCall("echo", meth))
+    let method_checker = newStmtList(def_vars)
+    if params[0] == ident("void") or params[0].kind == nnkEmpty:
+      method_checker.add meth
+    else:
+      method_checker.add nnkLetSection.newTree(newIdentDefs(genSym(), params[0], meth))
 
     let proc_str = "proc " & ident_defs.repr.replace("RootRef", $impl_name).replace(": proc ", "").replace("`" & $prop & "`", $method_name)
     result.add quote do:
       when not compiles(`method_checker`):
         {.fatal: "proc undefined when implements " & $`inf_name` & ":\p  " & `proc_str`.}
 
-proc add_method_variable(impl_name, inf_name: NimNode): NimNode =
-  result = newStmtList()
-
-  for ident_defs in inf_name.get_vtable_records_from_interface:
-    let
-      (prop, method_name) = get_method_name_pair(ident_defs[0])
-      proc_type = ident_defs[1].copy
-      params = proc_type[0]
-      proc_name = get_proc_variable(impl_name, prop)
-
-    params[1][^2] = impl_name
-    let to_string = newLit(is_tostring_method(method_name, params))
-
-    result.add quote do:
-      when not declared(`proc_name`):
-        when `to_string` and not compiles((var x: `impl_name`; discard $x)):
-          proc `method_name`(x: `impl_name`): string = $x[]
-        let `proc_name`: `proc_type` = `method_name`
+proc add_tostring_proc(impl_name: NimNode): NimNode =
+  let method_name = nnkAccQuoted.newTree(ident("$"))
+  result = quote do:
+    when not compiles((var x: `impl_name`; discard $x)):
+      proc `method_name`(x: `impl_name`): string = $x[]
 
 proc get_interface_vtable(impl_name, inf_name, var_name: NimNode): NimNode =
   let
@@ -209,10 +193,11 @@ proc get_interface_vtable(impl_name, inf_name, var_name: NimNode): NimNode =
     let
       (prop, method_name) = get_method_name_pair(ident_defs[0])
       proc_type = ident_defs[1]
-      proc_name = get_proc_variable(impl_name, prop)
+      real_proc_type = proc_type.copy
 
+    real_proc_type[0][1][^2] = impl_name
     let proc_name_casted = quote do:
-      cast[`proc_type`](cast[pointer](`proc_name`))
+      cast[`proc_type`](cast[pointer]((`real_proc_type`)(`method_name`)))
     vtable_cons.add newColonExpr(prop, proc_name_casted)
 
   newVarStmt(var_name, vtable_cons)
@@ -283,7 +268,7 @@ macro impl*(impl_name: typed{type}, inf_names: varargs[typed]) : untyped =
       bases = get_interface_bases_all(inf_name)
 
     result.add add_method_checker(impl_name, inf_name)
-    result.add add_method_variable(impl_name, inf_name)
+    result.add add_tostring_proc(impl_name)
 
     for inf_index, base in bases:
       result.add add_object_converter(impl_name, base, inf_index, implict_converter)
