@@ -27,6 +27,9 @@ proc remove_postfix(n: NimNode): NimNode =
 proc export_postfix(n: NimNode, exported = true): NimNode =
   if exported: postfix(n, "*") else: n
 
+proc unpack_varty(typ: NimNode): NimNode =
+  if typ.kind == nnkVarTy: typ[0] else: typ
+
 proc is_tostring_method(method_name, params: NimNode): bool =
   method_name.kind == nnkAccQuoted and $method_name == "$" and
     params.len == 2 and params[1].len == 3
@@ -171,7 +174,7 @@ proc add_method_checker(impl_name, inf_name: NimNode): NimNode =
       continue
 
     for name, typ in param_pairs(params, false):
-      def_vars.add newIdentDefs(name, typ)
+      def_vars.add newIdentDefs(name, typ.unpack_varty)
       meth.add name
 
     # change first argument type to `impl_name`
@@ -181,7 +184,8 @@ proc add_method_checker(impl_name, inf_name: NimNode): NimNode =
     if params[0] == ident("void") or params[0].kind == nnkEmpty:
       method_checker.add meth
     else:
-      method_checker.add nnkLetSection.newTree(newIdentDefs(genSym(), params[0], meth))
+      # check the return value
+      method_checker.add nnkLetSection.newTree(newIdentDefs(genSym(), params[0].unpack_varty, meth))
 
     let proc_str = "proc " & ident_defs.repr.replace("RootRef", $impl_name).replace(": proc ", "").replace("`" & $prop & "`", $method_name)
     result.add quote do:
