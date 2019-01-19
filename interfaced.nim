@@ -71,22 +71,32 @@ proc set_interface_converter_created(inf: NimNode, created = true) =
   assert id >= 0
   iinfos[id].created = created
 
-proc get_or_add_impl(inf_name: NimNode, impl_name: NimNode): int =
+proc get_implemented_index(inf_name: NimNode, impl_name: NimNode, add_if_not_present = false): int =
   let id = get_interface_id(inf_name)
   assert id >= 0
 
   let info = iinfos[id]
 
+  result = -1
   for i, imp in info.impls:
     if eqIdent(imp, impl_name):
-      return i
+      result = i
+      break
 
-  info.impls.add(impl_name)
+  if result == -1 and add_if_not_present:
+    info.impls.add(impl_name)
+    if info.impls.len > MAX_IMPLEMENTS:
+      error("Too many implments for " & $inf_name & "\nPlease change the MAX_IMPLEMENTS")
+    result = info.impls.len-1
 
-  if info.impls.len > MAX_IMPLEMENTS:
-    error("Too many implments for " & $inf_name & "\nPlease change the MAX_IMPLEMENTS")
+proc get_or_add_implementation(inf_name: NimNode, impl_name: NimNode): int =
+  get_implemented_index(inf_name, impl_name, true)
 
-  return info.impls.len-1
+proc add_interface_implementation(inf_name: NimNode, impl_name: NimNode) =
+  discard get_implemented_index(inf_name, impl_name, true)
+
+proc is_implemented(inf_name: NimNode, impl_name: NimNode): bool =
+  get_implemented_index(inf_name, impl_name, false) >= 0
 
 template get_vtable_symbol(inf_name: NimNode): NimNode =
   inf_name.getImpl[2][2][1][1][0]
@@ -206,32 +216,31 @@ proc add_method_dispatch_table(impl_name, inf_name: NimNode): NimNode =
   let
     dispatch_table = get_dispatch_table_var(inf_name)
     bases = get_interface_bases_all(inf_name)
-    impl_index = get_or_add_impl(inf_name, impl_name)
+    impl_index = get_implemented_index(inf_name, impl_name)
     vtable = genSym(nskVar)
 
+  assert(impl_index >= 0)
   result = newStmtList()
   result.add get_interface_vtable(impl_name, inf_name, vtable)
   result.add quote do:
     `dispatch_table`[`impl_index`] = cast[pointer](addr `vtable`)
 
   if has_interface_bases(inf_name):
-    let
-      dispatch_indexes = get_dispatch_indexes_var(inf_name)
-
+    let dispatch_indexes = get_dispatch_indexes_var(inf_name)
     for i, base in bases:
-      let inf_index = get_or_add_impl(base, impl_name)
+      let inf_impl_index = get_implemented_index(base, impl_name)
+      assert(inf_impl_index >= 0)
       result.add quote do:
-        `dispatch_indexes`[`impl_index`][`i`] = `inf_index`
+        `dispatch_indexes`[`impl_index`][`i`] = `inf_impl_index`
 
 proc add_object_converter(impl_name, inf_name: NimNode, inf_index: int, implict_converter: bool): NimNode =
   let
     dispatch_table = get_dispatch_table_var(inf_name)
     inf_vtable = inf_name.get_vtable_symbol
     this_param = ident("self")
-    impl_index = get_or_add_impl(inf_name, impl_name)
-    const_converter_var = ident($impl_name & "To" & $inf_name & "ConverterDefined")
-    implict_converter = newLit(implict_converter)
+    impl_index = get_implemented_index(inf_name, impl_name)
 
+  assert(impl_index >= 0)
   let constructor_name = get_interface_constructor_name(inf_name)
   let inf_constructor = quote do:
     `constructor_name`(cast[RootRef](`this_param`), cast[ptr `inf_vtable`](`dispatch_table`[`impl_index`]))
@@ -239,16 +248,16 @@ proc add_object_converter(impl_name, inf_name: NimNode, inf_index: int, implict_
   if has_interface_bases(inf_name):
     inf_constructor.add newLit(impl_index)
 
-  let
-    converter_name = ident($impl_name & "To" & $inf_name & "Converter")
-    cast_name = ident("to" & $inf_name)
+  result = newStmtList()
 
-  quote do:
-    when not declared(`const_converter_var`):
-      const `const_converter_var` = true
-      proc `cast_name`*(`this_param`: `impl_name`) : `inf_name` = `inf_constructor`
-      when `implict_converter`:
-        converter `converter_name`*(`this_param`: `impl_name`) : `inf_name` = `inf_constructor`
+  let cast_name = ident("to" & $inf_name)
+  result.add quote do:
+    proc `cast_name`*(`this_param`: `impl_name`) : `inf_name` = `inf_constructor`
+
+  if implict_converter:
+    let converter_name = ident($impl_name & "To" & $inf_name & "Converter")
+    result.add quote do:
+      converter `converter_name`*(`this_param`: `impl_name`) : `inf_name` = `inf_constructor`
 
 macro impl*(impl_name: typed{type}, inf_names: varargs[typed]) : untyped =
   var
@@ -271,7 +280,11 @@ macro impl*(impl_name: typed{type}, inf_names: varargs[typed]) : untyped =
     result.add add_tostring_proc(impl_name)
 
     for inf_index, base in bases:
-      result.add add_object_converter(impl_name, base, inf_index, implict_converter)
+      if not is_implemented(base, impl_name):
+        add_interface_implementation(base, impl_name)
+        result.add add_object_converter(impl_name, base, inf_index, implict_converter)
+
+    for base in bases:
       result.add add_method_dispatch_table(impl_name, base)
 
   when defined(interfacedebug):
@@ -298,11 +311,10 @@ proc create_interface_method_impl(inf_name: NimNode): NimNode =
       (prop, method_name) = get_method_name_pair(ident_defs[0])
       params = ident_defs[1][0]
       this_param = params[1][0]
-      meth = newProc(export_postfix(method_name))
+      meth = newProc(export_postfix(method_name), proc_type = nnkTemplateDef)
 
-    meth.params = params.copy
+    meth.params = params
     meth.params[1][1] = ident($inf_name)
-    meth[4] = nnkPragma.newTree(ident("inline"))
 
     meth.body = quote do:
       `this_param`.vtable.`prop`(`this_param`.obj)
